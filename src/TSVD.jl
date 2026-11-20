@@ -9,6 +9,7 @@ module TSVD
     using LinearAlgebra
     using LinearAlgebra: BlasComplex, BlasFloat, BlasInt, BlasReal
     using Adapt: adapt
+    using Random: randn!
 
     include("common.jl")
     include("eig.jl")

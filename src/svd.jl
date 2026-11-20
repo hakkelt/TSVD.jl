@@ -1,6 +1,42 @@
+# Orthogonalize x against the vectors in Q. Two passes of modified Gram-Schmidt
+# give orthogonality to working precision.
+function _orthogonalize!(x, Q)
+    for _ in 1:2, q in Q
+        axpy!(-dot(q, x), q, x)
+    end
+    return x
+end
+
+# Called when the new Lanczos vector x has a small norm, so it may consist of
+# rounding errors and components along Q that partial reorthogonalization has
+# let through. Orthogonalize x fully against Q. If its norm is then at most tol,
+# the Krylov subspace is invariant (breakdown): replace x by a random unit vector
+# orthogonal to Q, or by zeros when Q already spans the whole space (room is
+# false), and return a zero norm. Otherwise return the new norm; x is left
+# unnormalized.
+function _orthogonalize_or_restart!(x, Q, tol, room)
+    _orthogonalize!(x, Q)
+    nrm = norm(x)
+    nrm > tol && return nrm
+    if room
+        randn!(x)
+        _orthogonalize!(x, Q)
+        rmul!(x, inv(norm(x)))
+    else
+        fill!(x, zero(eltype(x)))
+    end
+    return zero(nrm)
+end
+
+# A Lanczos coefficient below sqrt(eps)*norm(A) may be dominated by rounding
+# errors; τ is eps times an estimate of norm(A).
+_is_small(x, τ) = x <= sqrt(eps(typeof(τ)))*τ/eps(typeof(τ))
+
 function _biLanczosIterations!(A, stepsize, αs, βs, U, V, μs, νs, maxνs, maxμs, τ, reorth_in, tolreorth, debug)
 
     m, n = size(A)
+    # The bases cannot grow beyond the dimensions of A
+    kmax = min(m, n)
     reorth_μ = reorth_in
     nReorth = 0
     nReorthVecs = 0
@@ -15,6 +51,8 @@ function _biLanczosIterations!(A, stepsize, αs, βs, U, V, μs, νs, maxνs, ma
     β = βs[iter]
 
     for j = iter .+ (1:stepsize)
+        j > kmax && break
+
         # The v step
         vOld = v
         ## apply operator
@@ -26,35 +64,49 @@ function _biLanczosIterations!(A, stepsize, αs, βs, U, V, μs, νs, maxνs, ma
         τ = max(τ, eps(Tr) * (α + β))
         debug && @show τ
 
-        ## run ω recurrence
         reorth_ν = false
-        for i = 1:j - 1
-            ν = βs[i]*μs[i + 1] + αs[i]*μs[i] - β*νs[i]
-            ν = (ν + copysign(τ, ν))/α
-            if abs(ν) > tolreorth
-                reorth_ν |= true
-            end
-            νs[i] = ν
-        end
-        if j > 1
-            push!(maxνs, maximum(abs, νs))
-        end
-        push!(νs, 1)
-
-        ## reorthogonalize if necessary
-        if reorth_ν || reorth_μ
-            debug && println("Reorth v")
+        if _is_small(α, τ)
+            ## possible breakdown; v is fully orthogonal to V afterwards
+            debug && println("Small α: orthogonalize v")
+            α = _orthogonalize_or_restart!(v, V, max(m, n)*τ, true)
             for i in 1:j - 1
-                axpy!(-dot(V[i], v), V[i], v)
                 νs[i] = eps(Tr)
-                nReorthVecs += 1
             end
-            α = norm(v)
+            if j > 1
+                push!(maxνs, eps(Tr))
+            end
+            push!(νs, 1)
+            reorth_ν = true
+        else
+            ## run ω recurrence
+            for i = 1:j - 1
+                ν = βs[i]*μs[i + 1] + αs[i]*μs[i] - β*νs[i]
+                ν = (ν + copysign(τ, ν))/α
+                if abs(ν) > tolreorth
+                    reorth_ν |= true
+                end
+                νs[i] = ν
+            end
+            if j > 1
+                push!(maxνs, maximum(abs, νs))
+            end
+            push!(νs, 1)
+
+            ## reorthogonalize if necessary
+            if reorth_ν || reorth_μ
+                debug && println("Reorth v")
+                for i in 1:j - 1
+                    axpy!(-dot(V[i], v), V[i], v)
+                    νs[i] = eps(Tr)
+                    nReorthVecs += 1
+                end
+                α = norm(v)
+            end
         end
 
         ## update the result vectors
         push!(αs, α)
-        rmul!(v, inv(α))
+        iszero(α) || rmul!(v, inv(α))
         push!(V, v)
 
         # The u step
@@ -68,37 +120,51 @@ function _biLanczosIterations!(A, stepsize, αs, βs, U, V, μs, νs, maxνs, ma
         τ = max(τ, eps(Tr) * (α + β))
         debug && @show τ
 
-        ## run ω recurrence
         reorth_μ = false
-        for i = 1:j
-            μ = αs[i]*νs[i] - α*μs[i]
-            if i > 1
-                μ += βs[i - 1]*νs[i-1]
-            end
-            μ = (μ + copysign(τ, μ))/β
-            if abs(μ) > tolreorth
-                reorth_μ |= true
-            end
-            μs[i] = μ
-        end
-        push!(maxμs, maximum(μs))
-        push!(μs, 1)
-
-        ## reorthogonalize if necessary
-        if reorth_ν || reorth_μ
-            debug && println("Reorth u")
+        # When j == m, U already spans the whole space, so β is zero in exact
+        # arithmetic.
+        if _is_small(β, τ) || j == m
+            ## possible breakdown; u is fully orthogonal to U afterwards
+            debug && println("Small β: orthogonalize u")
+            β = _orthogonalize_or_restart!(u, U, max(m, n)*τ, j < m)
             for i in 1:j
-                axpy!(-dot(U[i], u), U[i], u)
                 μs[i] = eps(Tr)
-                nReorthVecs += 1
             end
-            β = norm(u)
-            nReorth += 1
+            push!(maxμs, eps(Tr))
+            push!(μs, 1)
+            reorth_μ = true
+        else
+            ## run ω recurrence
+            for i = 1:j
+                μ = αs[i]*νs[i] - α*μs[i]
+                if i > 1
+                    μ += βs[i - 1]*νs[i-1]
+                end
+                μ = (μ + copysign(τ, μ))/β
+                if abs(μ) > tolreorth
+                    reorth_μ |= true
+                end
+                μs[i] = μ
+            end
+            push!(maxμs, maximum(μs))
+            push!(μs, 1)
+
+            ## reorthogonalize if necessary
+            if reorth_ν || reorth_μ
+                debug && println("Reorth u")
+                for i in 1:j
+                    axpy!(-dot(U[i], u), U[i], u)
+                    μs[i] = eps(Tr)
+                    nReorthVecs += 1
+                end
+                β = norm(u)
+                nReorth += 1
+            end
         end
 
         ## update the result vectors
         push!(βs, β)
-        rmul!(u, inv(β))
+        iszero(β) || rmul!(u, inv(β))
         push!(U, u)
     end
 
@@ -117,6 +183,12 @@ function biLanczos(A,
     Tv = eltype(initvec)
     Tr = real(Tv)
 
+    m, n = size(A)
+    kmax = min(m, n)
+    if nvals > kmax
+        throw(ArgumentError("cannot compute $nvals singular values of a $m×$n matrix"))
+    end
+
     # I need to append βs with a zero at each iteration. Tt is much easier for type inference if it is a vector with the right element type
     z = zeros(Tr, 1)
 
@@ -126,12 +198,17 @@ function biLanczos(A,
     v = A'initvec
     rmul!(v, inv(nrmInit))
     α = norm(v)
-    if isone(α)
-        # We need v to change when scaled with α.
-        # Otherwise the basis generation might break down.
-        α = nextfloat(α)
+    if iszero(α)
+        # initvec is in the null space of A'. Continue from a random vector.
+        _orthogonalize_or_restart!(v, typeof(v)[], zero(α), true)
+    else
+        if isone(α)
+            # We need v to change when scaled with α.
+            # Otherwise the basis generation might break down.
+            α = nextfloat(α)
+        end
+        rmul!(v, inv(α))
     end
-    rmul!(v, inv(α))
     V = fill(v, 1)
     αs = fill(α, 1)
 
@@ -141,14 +218,19 @@ function biLanczos(A,
     rmul!(uOld, inv(nrmInit))
     axpy!(eltype(u)(-α), uOld, u)
     β = norm(u)
-    rmul!(u, inv(β))
-    U = typeof(u)[uOld, u]
-    βs = fill(β, 1)
 
     # error estimate used in ω recurrence
     τ = eps(Tr)*(α + β)
-    ν = 1 + τ/α
-    μ = τ/β
+
+    if _is_small(β, τ) || m == 1
+        β = _orthogonalize_or_restart!(u, (uOld,), max(m, n)*τ, m > 1)
+    else
+        rmul!(u, inv(β))
+    end
+    U = typeof(u)[uOld, u]
+    βs = fill(β, 1)
+
+    μ = iszero(β) ? eps(Tr) : τ/β
 
     # Arrays for saving the estimates of the maximum angles between Lanczos vectors
     maxμs = Tr[]
@@ -165,11 +247,18 @@ function biLanczos(A,
     # Save the estimates of the maximum angles between Lanczos vectors
     # append!(maxμs, maxμ)
 
-    hasConv = false
-    while iter <= maxiter
+    # Once the bases span the smaller dimension of A, the bidiagonal matrix
+    # holds the singular values of A exactly.
+    hasConv = length(αs) == kmax
+    while !hasConv && iter <= maxiter
 
         reorth_μ = _biLanczosIterations!(A, stepsize, αs, βs, U, V, μs, νs, maxμs, maxνs, τ, reorth_μ, tolreorth, debug)
         iter += stepsize
+
+        if length(αs) == kmax
+            hasConv = true
+            break
+        end
 
         # This is more expensive than necessary because we only need the last components. However, LAPACK doesn't support this.
         UU, ss, VV = svd(Bidiagonal([αs;z], βs, :L))
@@ -179,8 +268,10 @@ function biLanczos(A,
         # Test for convergence. A Ritzvalue is considered converged if
         # either the last component of the corresponding vector is (relatively)
         # small or if the last component in βs is small (or both)
-        if all(abs.(UU[end, 1:nvals])*βs[end] .< tolconv*ss[1:nvals]) &&
-           all(abs.(VV[end, 1:nvals])*βs[end] .< tolconv*ss[1:nvals])
+        # Use <= so that zero singular values of a rank-deficient A converge
+        # once βs[end] is zero.
+        if all(abs.(UU[end, 1:nvals])*βs[end] .<= tolconv*ss[1:nvals]) &&
+           all(abs.(VV[end, 1:nvals])*βs[end] .<= tolconv*ss[1:nvals])
             hasConv = true
             break
         end
@@ -194,27 +285,23 @@ function biLanczos(A,
         error("no convergence")
     end
 
-    # Form upper bidiagonal square matrix
-    # m = length(U[1])
-    # for j = 1:length(αs)
-    #     # Calculate Givens rotation
-    #     c, s, αs[j] = givensAlgorithm(αs[j], βs[j])
-
-    #     # Update left vector
-    #     # for i = 1:m
-    #     #     uij       = U[j][i]
-    #     #     uij1      = U[j+1][i]
-    #     #     U[j][i]   = uij*c + uij1*s'
-    #     #     U[j+1][i] = uij1*c - uij*s
-    #     # end
-
-    #     # Update bidiagonal matrix
-    #     if j < length(αs)
-    #         αj1 = αs[j + 1]
-    #         αs[j + 1] = c*αj1
-    #         βs[j] = s*αj1
-    #     end
-    # end
+    if length(αs) == n < m
+        # V spans the whole domain of A, so A*V = U*B̃ holds exactly, where B̃ is
+        # the lower bidiagonal matrix with the extra row βs[end]*e_n'. Rotate that
+        # row into a square upper bidiagonal matrix, which then has the singular
+        # values of A, and rotate U to match.
+        for j = 1:n
+            c, s, r = LinearAlgebra.givensAlgorithm(αs[j], βs[j])
+            uj, uj1 = U[j], U[j + 1]
+            U[j], U[j + 1] = c*uj + s*uj1, c*uj1 - s*uj
+            αs[j] = r
+            if j < n
+                βs[j] = s*αs[j + 1]
+                αs[j + 1] = c*αs[j + 1]
+            end
+        end
+        return U, Bidiagonal(αs, βs[1:end-1], :U), V, maxμs, maxνs
+    end
 
     return U, Bidiagonal(αs, βs[1:end-1], :L), V, maxμs, maxνs
 end
@@ -286,7 +373,7 @@ and
 
 corresponding to the operations `y := α*op(A)*x + β*y` where `op` can be either the identity or the conjugate transpose of `A`. If the `initvec` argument is not supplied then it is furthermore required that `A` supports `eltype` and `size`.
 
-- `nvals`: The number of singular values and vectors to compute. Default is one (the largest).
+- `nvals`: The number of singular values and vectors to compute, at most `minimum(size(A))`. Default is one (the largest).
 
 
 
